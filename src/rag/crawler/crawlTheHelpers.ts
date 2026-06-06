@@ -67,6 +67,7 @@ export function extractFileUrls(text: string) {
 }
 
 export function extractResourceCandidatesFromHtml(html: string, baseUrl: string): ResourceCandidate[] {
+  html = html.replace(/<svg\b[^>]*>([\s\S]*?)<\/svg>/gi, "");
   const candidates: ResourceCandidate[] = [];
   const headingPattern = /<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/gi;
   const headingMatches = [...html.matchAll(headingPattern)];
@@ -212,7 +213,8 @@ export async function crawlTheHelpers(outputPath = "data/crawl/thehelpers-resour
 }
 
 function stripHtml(input: string) {
-  return input.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  const cleanStart = input.replace(/^[^<]*>/, "");
+  return cleanStart.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function inferResourceTitle(href?: string, onclick?: string) {
