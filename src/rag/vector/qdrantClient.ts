@@ -5,6 +5,7 @@ import type { ScoredVectorDocument, VectorClient, VectorDocument, VectorSearchFi
 
 const memoryStore: VectorDocument[] = [];
 const genericSearchTerms = new Set(["what", "where", "when", "how", "the", "and", "for", "official", "srm", "srmist", "policy", "rules", "info"]);
+let seedPromise: Promise<void> | null = null;
 
 function cosine(a: number[], b: number[]) {
   const dot = a.reduce((sum, value, index) => sum + value * (b[index] ?? 0), 0);
@@ -14,6 +15,15 @@ function cosine(a: number[], b: number[]) {
 }
 
 async function seedMemoryStore() {
+  if (memoryStore.some((doc) => doc.id.startsWith("seed:"))) return;
+  if (seedPromise) return seedPromise;
+  seedPromise = seedMemoryStoreOnce().finally(() => {
+    seedPromise = null;
+  });
+  return seedPromise;
+}
+
+async function seedMemoryStoreOnce() {
   if (memoryStore.some((doc) => doc.id.startsWith("seed:"))) return;
   const now = new Date().toISOString();
   for (const source of officialSources) {
@@ -150,6 +160,7 @@ export function getVectorClient() {
 
 export function clearMemoryVectorStore() {
   memoryStore.splice(0, memoryStore.length);
+  seedPromise = null;
 }
 
 function matchesFilter(doc: VectorDocument, filter: VectorSearchFilter) {
