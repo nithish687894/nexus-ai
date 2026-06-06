@@ -1,0 +1,14 @@
+[
+  {
+    "url": "https://thehelpers.tech/",
+    "title": "THE HELPER",
+    "category": "study_resources",
+    "sourceType": "public_study_material",
+    "source": "thehelpers",
+    "official": false,
+    "type": "webpage",
+    "enabled": true,
+    "checkFrequency": "daily",
+    "priority": "high"
+  }
+]

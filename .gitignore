@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+.DS_Store
+npm-debug.log*
+coverage/
+data/processed/chunks.jsonl
+tests/.tmp/
+storage/raw/**/*
+!storage/raw/**/.gitkeep

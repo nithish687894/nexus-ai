@@ -1,0 +1,46 @@
+[
+  {
+    "url": "https://www.srmist.edu.in/students/",
+    "title": "Students | SRMIST",
+    "category": "general",
+    "type": "webpage",
+    "sourceType": "official_srm",
+    "official": true,
+    "enabled": true,
+    "checkFrequency": "weekly",
+    "priority": "medium"
+  },
+  {
+    "url": "https://sp.srmist.edu.in/",
+    "title": "SRM Student Portal",
+    "category": "student_portal",
+    "type": "webpage",
+    "sourceType": "official_srm",
+    "official": true,
+    "enabled": true,
+    "checkFrequency": "daily",
+    "priority": "high"
+  },
+  {
+    "url": "https://www.srmist.edu.in/academics/",
+    "title": "Academics | SRMIST",
+    "category": "academics",
+    "type": "webpage",
+    "sourceType": "official_srm",
+    "official": true,
+    "enabled": true,
+    "checkFrequency": "weekly",
+    "priority": "medium"
+  },
+  {
+    "url": "https://www.srmist.edu.in/examination/",
+    "title": "Controller of Examinations | SRMIST",
+    "category": "coe",
+    "type": "webpage",
+    "sourceType": "official_srm",
+    "official": true,
+    "enabled": true,
+    "checkFrequency": "daily",
+    "priority": "high"
+  }
+]

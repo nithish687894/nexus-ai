@@ -1,0 +1,32 @@
+{
+  "name": "nexus-ai",
+  "version": "1.0.0",
+  "description": "Standalone safe AI microservice for SRM Nexus.",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc",
+    "ingest:srm": "tsx src/scripts/ingestSrm.ts",
+    "watch:srm": "tsx src/scripts/watchSrm.ts",
+    "crawl:thehelpers": "tsx src/scripts/crawlTheHelpers.ts",
+    "download:thehelpers": "tsx src/scripts/downloadTheHelpers.ts",
+    "ingest:thehelpers": "tsx src/scripts/ingestTheHelpers.ts",
+    "watch:thehelpers": "tsx src/scripts/watchTheHelpers.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.8",
+    "hono": "^4.6.16",
+    "pdf-parse": "^2.4.5",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "playwright": "^1.60.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.8"
+  }
+}
