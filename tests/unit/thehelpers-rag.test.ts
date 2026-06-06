@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyResourceType } from "../../src/rag/crawler/crawlTheHelpers.js";
+import { classifyResourceType, extractResourceCandidatesFromHtml } from "../../src/rag/crawler/crawlTheHelpers.js";
 import { extractSemesterLinks, extractSubjectLinks } from "../../src/rag/crawler/extractLinks.js";
 import { assertSafePublicUrl } from "../../src/rag/downloader/downloadFile.js";
 import { classifyDriveUrl, extractDriveFileId, extractDriveFolderId, normalizeDriveUrl } from "../../src/rag/downloader/googleDrive.js";
@@ -18,6 +18,25 @@ describe("THE HELPER resource helpers", () => {
     const html = `<a href="/semesters/1">Sem 1</a><a href="/semesters/1/subjects/Calculus%20And%20Linear%20Algebra">CLA</a>`;
     expect(extractSemesterLinks(html)).toContain("https://thehelpers.tech/semesters/1");
     expect(extractSubjectLinks(html)).toContain("https://thehelpers.tech/semesters/1/subjects/Calculus%20And%20Linear%20Algebra");
+  });
+
+  it("extracts resource candidates with section context", () => {
+    const html = `
+      <h2>Previous Year Questions</h2>
+      <div><span>PYQ Dec 2023</span><a href="/file-viewer?id=dec2023">View</a></div>
+      <h2>Study Notes And Other Resources</h2>
+      <a href="https://drive.google.com/file/d/note123/view">Class Notes Chapter 1</a>
+    `;
+    const candidates = extractResourceCandidatesFromHtml(html, "https://thehelpers.tech/semesters/1/subjects/Calculus%20And%20Linear%20Algebra");
+    expect(candidates[0]).toMatchObject({
+      section: "Previous Year Questions",
+      resourceTitle: "PYQ Dec 2023",
+      href: "https://thehelpers.tech/file-viewer?id=dec2023"
+    });
+    expect(candidates[1]).toMatchObject({
+      section: "Study Notes And Other Resources",
+      resourceTitle: "Class Notes Chapter 1"
+    });
   });
 
   it("parses Google Drive URLs safely", () => {

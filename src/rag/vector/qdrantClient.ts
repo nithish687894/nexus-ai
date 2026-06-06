@@ -1,6 +1,7 @@
 import { env } from "../../config/env.js";
 import { createEmbedding } from "../embeddings/embeddingProvider.js";
 import { officialSources } from "../data/officialSources.js";
+import { readJsonl } from "../indexing/metadataStore.js";
 import type { ScoredVectorDocument, VectorClient, VectorDocument, VectorSearchFilter } from "./vectorClient.js";
 
 const memoryStore: VectorDocument[] = [];
@@ -15,7 +16,6 @@ function cosine(a: number[], b: number[]) {
 }
 
 async function seedMemoryStore() {
-  if (memoryStore.some((doc) => doc.id.startsWith("seed:"))) return;
   if (seedPromise) return seedPromise;
   seedPromise = seedMemoryStoreOnce().finally(() => {
     seedPromise = null;
@@ -24,37 +24,38 @@ async function seedMemoryStore() {
 }
 
 async function seedMemoryStoreOnce() {
-  if (memoryStore.some((doc) => doc.id.startsWith("seed:"))) return;
-  const now = new Date().toISOString();
-  for (const source of officialSources) {
-    memoryStore.push({
-      id: `seed:${source.source_url}`,
-      content: source.content,
-      embedding: await createEmbedding(`${source.title} ${source.content}`),
-      metadata: {
-        source_url: source.source_url,
-        title: source.title,
-        category: source.category,
-        type: "webpage",
-        sourceType: "official_srm",
-        official: true,
-        version: 1,
-        is_latest: true,
-        status: "active",
-        last_checked_at: now,
-        ingested_at: now,
-        content_hash: `seed-${source.category}`
-      }
-    });
+  if (!memoryStore.some((doc) => doc.id.startsWith("seed:"))) {
+    const now = new Date().toISOString();
+    for (const source of officialSources) {
+      upsertMemoryDocument({
+        id: `seed:${source.source_url}`,
+        content: source.content,
+        embedding: await createEmbedding(`${source.title} ${source.content}`),
+        metadata: {
+          source_url: source.source_url,
+          title: source.title,
+          category: source.category,
+          type: "webpage",
+          sourceType: "official_srm",
+          official: true,
+          version: 1,
+          is_latest: true,
+          status: "active",
+          last_checked_at: now,
+          ingested_at: now,
+          content_hash: `seed-${source.category}`
+        }
+      });
+    }
   }
+  await seedProcessedChunks("data/processed/srm-chunks.jsonl");
+  await seedProcessedChunks("data/processed/thehelpers-chunks.jsonl");
 }
 
 export const memoryVectorClient: VectorClient = {
   async upsert(documents) {
     documents.forEach((document) => {
-      const existingIndex = memoryStore.findIndex((stored) => stored.id === document.id);
-      if (existingIndex >= 0) memoryStore.splice(existingIndex, 1, document);
-      else memoryStore.push(document);
+      upsertMemoryDocument(document);
     });
   },
   async search(query, limit = 5, filter: VectorSearchFilter = {}) {
@@ -161,6 +162,24 @@ export function getVectorClient() {
 export function clearMemoryVectorStore() {
   memoryStore.splice(0, memoryStore.length);
   seedPromise = null;
+}
+
+async function seedProcessedChunks(path: string) {
+  const rows = await readJsonl<{ id: string; text: string; metadata: VectorDocument["metadata"] }>(path);
+  for (const row of rows) {
+    upsertMemoryDocument({
+      id: row.id,
+      content: row.text,
+      embedding: await createEmbedding(`${row.metadata.title} ${row.text}`),
+      metadata: row.metadata
+    });
+  }
+}
+
+function upsertMemoryDocument(document: VectorDocument) {
+  const existingIndex = memoryStore.findIndex((stored) => stored.id === document.id);
+  if (existingIndex >= 0) memoryStore.splice(existingIndex, 1, document);
+  else memoryStore.push(document);
 }
 
 function matchesFilter(doc: VectorDocument, filter: VectorSearchFilter) {

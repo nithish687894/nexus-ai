@@ -25,11 +25,25 @@ export async function downloadTheHelpersResources(
 
   for (const resource of resources) {
     const candidateUrl = resource.downloadUrl || resource.driveUrl || resource.iframeUrl || resource.fileViewerUrl || resource.subjectPageUrl;
+    const metadataIdentity = `${resource.subjectPageUrl}:${resource.section}:${resource.resourceTitle}`;
     if (!candidateUrl) {
       summary.metadataOnly += 1;
+      rows.push({
+        ...resource,
+        resourceType: resource.resourceType ?? classifyResourceType(resource.section, resource.resourceTitle),
+        document_id: stableDocumentId(metadataIdentity),
+        fileType: "unknown",
+        downloadStatus: "metadata_only",
+        contentHash: contentHash(metadataIdentity),
+        sizeBytes: 0,
+        downloadedAt: new Date().toISOString()
+      });
       continue;
     }
-    const normalized = resource.driveUrl ? normalizeDriveUrl(resource.driveUrl) : candidateUrl;
+    const hasDirectResourceUrl = Boolean(resource.downloadUrl || resource.driveUrl || resource.iframeUrl || resource.fileViewerUrl);
+    const normalized = hasDirectResourceUrl
+      ? resource.driveUrl ? normalizeDriveUrl(resource.driveUrl) : candidateUrl
+      : metadataIdentity;
     if (seen.has(normalized)) {
       summary.duplicatesSkipped += 1;
       continue;
@@ -38,7 +52,9 @@ export async function downloadTheHelpersResources(
     if (resource.driveUrl) summary.driveLinksFound += 1;
 
     let result: DownloadResult & { contentHash: string } = { status: "metadata_only", fileType: "unknown", sizeBytes: 0, contentHash: contentHash(normalized) };
-    const directUrl = resource.driveUrl && classifyDriveUrl(resource.driveUrl) === "file" ? driveDirectDownloadUrl(resource.driveUrl) : candidateUrl;
+    const directUrl = hasDirectResourceUrl
+      ? resource.driveUrl && classifyDriveUrl(resource.driveUrl) === "file" ? driveDirectDownloadUrl(resource.driveUrl) : candidateUrl
+      : null;
     if (directUrl) {
       try {
         const download = await downloadPublicFile(directUrl, "thehelpers");
