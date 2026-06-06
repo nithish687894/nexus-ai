@@ -1,7 +1,7 @@
 import { chromium, type Page } from "playwright";
-import { writeJsonl } from "../indexing/metadataStore.js";
+import { writeJsonl, appendJsonl } from "../indexing/metadataStore.js";
 import { extractSemesterLinks, extractSubjectLinks } from "./extractLinks.js";
-import { withCrawlerDelay } from "./rateLimitCrawler.js";
+import { withCrawlerDelay, sleep } from "./rateLimitCrawler.js";
 
 export type TheHelpersResourceType = "pyq" | "answer_key" | "mcq" | "important_topics" | "notes" | "syllabus" | "strategy" | "unknown";
 
@@ -34,6 +34,33 @@ type FileViewerDetails = {
   downloadUrl?: string;
   driveUrl?: string;
   iframeUrl?: string;
+};
+
+export interface CrawlOptions {
+  semester?: number | "all";
+  subject?: string;
+  maxResources?: number;
+  outputPath?: string;
+}
+
+export type SemesterStats = {
+  semester: number;
+  subjectsFound: number;
+  resourcesFound: number;
+};
+
+export type TheHelpersCrawlSummary = {
+  semestersFound: number;
+  semesters: SemesterStats[];
+  totalSemestersCrawled: number;
+  totalSubjectsFound: number;
+  totalResourcesFound: number;
+  totalFileViewerLinksFound: number;
+  totalDownloadUrlsFound: number;
+  totalMetadataOnly: number;
+  totalDuplicatesSkipped: number;
+  totalFailedPages: number;
+  outputPath: string;
 };
 
 export function classifyResourceType(section = "", title = ""): TheHelpersResourceType {
@@ -104,6 +131,34 @@ export function extractResourceCandidatesFromHtml(html: string, baseUrl: string)
   return candidates;
 }
 
+export async function gotoWithRetry(page: Page, url: string, retries = 2, delayMs = 500): Promise<any> {
+  let attempt = 0;
+  while (true) {
+    try {
+      const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      const status = response?.status() ?? 200;
+      if (status === 403 || status === 429) {
+        if (attempt < retries) {
+          const backoff = delayMs * Math.pow(2, attempt);
+          await sleep(backoff);
+          attempt++;
+          continue;
+        }
+        throw new Error(`Failed to load ${url} with status ${status} after ${attempt} retries`);
+      }
+      return response;
+    } catch (error) {
+      if (attempt < retries) {
+        const backoff = delayMs * Math.pow(2, attempt);
+        await sleep(backoff);
+        attempt++;
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 async function resolveFileViewer(page: Page, fileViewerUrl: string): Promise<FileViewerDetails> {
   const networkUrls: string[] = [];
   const onRequest = (request: { url(): string }) => {
@@ -111,7 +166,7 @@ async function resolveFileViewer(page: Page, fileViewerUrl: string): Promise<Fil
   };
   page.on("request", onRequest);
   try {
-    await page.goto(fileViewerUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await gotoWithRetry(page, fileViewerUrl);
     await page.locator("text=Loading resource...").waitFor({ state: "hidden", timeout: 10_000 }).catch(() => undefined);
     await page.waitForTimeout(750);
     const pageData = await page.evaluate(() => {
@@ -149,16 +204,58 @@ async function resolveFileViewer(page: Page, fileViewerUrl: string): Promise<Fil
   }
 }
 
-async function extractResourcesFromSubjectPage(page: Page, subjectPageUrl: string): Promise<TheHelpersCrawlRecord[]> {
-  const semester = parseSemesterFromUrl(subjectPageUrl);
+async function extractResourcesFromSubjectPage(
+  page: Page,
+  subjectPageUrl: string,
+  options: {
+    semester: number;
+    subjectFilter?: string;
+    maxResources: number;
+    getCurrentCount: () => number;
+    incrementCount: () => void;
+    seenKeys: Set<string>;
+    incrementDuplicates: () => void;
+    incrementFailed: () => void;
+  }
+): Promise<TheHelpersCrawlRecord[]> {
+  const semester = options.semester;
   const subject = parseSubjectFromUrl(subjectPageUrl);
+  
   const candidates = extractResourceCandidatesFromHtml(await page.content(), subjectPageUrl);
   const records: TheHelpersCrawlRecord[] = [];
+  
   for (const candidate of candidates) {
+    if (options.getCurrentCount() >= options.maxResources) {
+      break;
+    }
+    
     const combined = `${candidate.href ?? ""} ${candidate.onclick ?? ""}`;
     const extracted = extractFileUrls(combined);
     const fileViewerUrl = candidate.href?.includes("/file-viewer") ? candidate.href : undefined;
-    const resolved: FileViewerDetails = fileViewerUrl ? await resolveFileViewer(page, fileViewerUrl).catch(() => ({ fileViewerUrl })) : {};
+    
+    // Stable dedupe check
+    const dedupeKey = buildDedupeKey(semester, subject, candidate.section, candidate.resourceTitle, fileViewerUrl ?? extracted.pdfUrl ?? extracted.imageUrl);
+    if (options.seenKeys.has(dedupeKey)) {
+      options.incrementDuplicates();
+      continue;
+    }
+    options.seenKeys.add(dedupeKey);
+    
+    let resolved: FileViewerDetails = {};
+    if (fileViewerUrl) {
+      try {
+        await withCrawlerDelay();
+        resolved = await resolveFileViewer(page, fileViewerUrl);
+      } catch (error) {
+        options.incrementFailed();
+        console.error(`Failed to resolve file viewer ${fileViewerUrl}:`, error);
+        resolved = { fileViewerUrl };
+      }
+      // Go back to subject page to handle next resource candidate
+      await withCrawlerDelay();
+      await gotoWithRetry(page, subjectPageUrl).catch(() => undefined);
+    }
+    
     records.push({
       source: "thehelpers",
       sourceType: "public_study_material",
@@ -175,41 +272,232 @@ async function extractResourcesFromSubjectPage(page: Page, subjectPageUrl: strin
       iframeUrl: resolved.iframeUrl,
       discoveredAt: new Date().toISOString()
     });
-    await page.goto(subjectPageUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
+    
+    options.incrementCount();
   }
+  
   return records;
 }
 
-export async function crawlTheHelpers(outputPath = "data/crawl/thehelpers-resources.jsonl") {
-  const maxSemesters = Number(process.env.THEHELPERS_MAX_SEMESTERS ?? 8);
-  const maxSubjects = Number(process.env.THEHELPERS_MAX_SUBJECTS ?? Number.MAX_SAFE_INTEGER);
+export function shouldCrawlSemester(semesterUrl: string, semesterFilter: number | "all"): boolean {
+  if (semesterFilter === "all") return true;
+  const sem = parseSemesterFromUrl(semesterUrl);
+  return sem === semesterFilter;
+}
+
+export function shouldCrawlSubject(subjectUrl: string, subjectFilter?: string): boolean {
+  if (!subjectFilter) return true;
+  const subjectName = parseSubjectFromUrl(subjectUrl).toLowerCase().trim();
+  const filter = subjectFilter.toLowerCase().trim();
+  return subjectName === filter;
+}
+
+export function buildDedupeKey(
+  semester: number,
+  subject: string,
+  section: string,
+  title: string,
+  fileUrlOrViewerUrl?: string
+): string {
+  return `${semester}|${subject.trim().toLowerCase()}|${section.trim().toLowerCase()}|${title.trim().toLowerCase()}|${(fileUrlOrViewerUrl || "").trim().toLowerCase()}`;
+}
+
+export function computeGroupedStats(records: TheHelpersCrawlRecord[], semestersFoundList: number[]): {
+  semesters: SemesterStats[];
+  totalSemestersCrawled: number;
+  totalSubjectsFound: number;
+  totalResourcesFound: number;
+  totalFileViewerLinksFound: number;
+  totalDownloadUrlsFound: number;
+  totalMetadataOnly: number;
+} {
+  const semestersMap = new Map<number, { subjects: Set<string>; resources: number }>();
+  
+  for (const record of records) {
+    if (!semestersMap.has(record.semester)) {
+      semestersMap.set(record.semester, { subjects: new Set<string>(), resources: 0 });
+    }
+    const semData = semestersMap.get(record.semester)!;
+    semData.subjects.add(record.subject);
+    semData.resources += 1;
+  }
+  
+  const semestersStats: SemesterStats[] = semestersFoundList.map((sem) => {
+    const data = semestersMap.get(sem);
+    return {
+      semester: sem,
+      subjectsFound: data ? data.subjects.size : 0,
+      resourcesFound: data ? data.resources : 0
+    };
+  });
+  
+  const totalSemestersCrawled = semestersMap.size;
+  let totalSubjectsFound = 0;
+  for (const data of semestersMap.values()) {
+    totalSubjectsFound += data.subjects.size;
+  }
+  
+  const totalResourcesFound = records.length;
+  const totalFileViewerLinksFound = records.filter((r) => r.fileViewerUrl).length;
+  const totalDownloadUrlsFound = records.filter((r) => r.downloadUrl).length;
+  
+  const totalMetadataOnly = records.filter((r) => {
+    return !Boolean(r.downloadUrl || r.driveUrl || r.iframeUrl || r.fileViewerUrl);
+  }).length;
+  
+  return {
+    semesters: semestersStats,
+    totalSemestersCrawled,
+    totalSubjectsFound,
+    totalResourcesFound,
+    totalFileViewerLinksFound,
+    totalDownloadUrlsFound,
+    totalMetadataOnly
+  };
+}
+
+export function formatSummary(summary: TheHelpersCrawlSummary): string {
+  const lines: string[] = [];
+  lines.push(`Semesters found: ${summary.semestersFound}\n`);
+  
+  for (const sem of summary.semesters) {
+    lines.push(`Semester ${sem.semester}:`);
+    lines.push(`  Subjects found: ${sem.subjectsFound}`);
+    lines.push(`  Resources found: ${sem.resourcesFound}\n`);
+  }
+  
+  lines.push(`Total:`);
+  lines.push(`  Semesters crawled: ${summary.totalSemestersCrawled}`);
+  lines.push(`  Subjects found: ${summary.totalSubjectsFound}`);
+  lines.push(`  Resources found: ${summary.totalResourcesFound}`);
+  lines.push(`  File viewer links found: ${summary.totalFileViewerLinksFound}`);
+  lines.push(`  Download URLs found: ${summary.totalDownloadUrlsFound}`);
+  lines.push(`  Metadata-only: ${summary.totalMetadataOnly}`);
+  lines.push(`  Duplicates skipped: ${summary.totalDuplicatesSkipped}`);
+  lines.push(`  Failed pages: ${summary.totalFailedPages}`);
+  
+  return lines.join("\n");
+}
+
+export async function crawlTheHelpers(options: CrawlOptions = {}): Promise<TheHelpersCrawlSummary> {
+  const semesterFilter = options.semester ?? "all";
+  const subjectFilter = options.subject;
+  const maxResources = options.maxResources ?? Number.MAX_SAFE_INTEGER;
+  const outputPath = options.outputPath ?? "data/crawl/thehelpers-resources.jsonl";
+
+  // Initialize/clear output file
+  await writeJsonl(outputPath, []);
+
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
   const records: TheHelpersCrawlRecord[] = [];
-  let visitedSemesters = 0;
-  let visitedSubjects = 0;
+  const seenKeys = new Set<string>();
+  
+  let totalResourcesCrawled = 0;
+  let totalDuplicatesSkipped = 0;
+  let totalFailedPages = 0;
+  let semestersFoundList: number[] = [];
+  let semestersFoundCount = 0;
+
   try {
-    await page.goto("https://thehelpers.tech/semesters", { waitUntil: "domcontentloaded", timeout: 30_000 });
-    const semesterLinks = extractSemesterLinks(await page.content());
-    for (const semesterUrl of semesterLinks.slice(0, maxSemesters)) {
-      await withCrawlerDelay();
-      await page.goto(semesterUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
-      visitedSemesters += 1;
-      const subjectLinks = extractSubjectLinks(await page.content());
-      for (const subjectUrl of subjectLinks) {
-        if (visitedSubjects >= maxSubjects) break;
+    try {
+      await gotoWithRetry(page, "https://thehelpers.tech/semesters");
+    } catch (err) {
+      totalFailedPages++;
+      throw new Error(`Failed to load root semesters page: ${err}`);
+    }
+
+    const semestersHtml = await page.content();
+    const semesterLinks = extractSemesterLinks(semestersHtml);
+    semestersFoundCount = semesterLinks.length;
+    semestersFoundList = semesterLinks.map((url) => parseSemesterFromUrl(url)).filter(Boolean);
+
+    const filteredSemesterLinks = semesterLinks.filter((url) => 
+      shouldCrawlSemester(url, semesterFilter)
+    );
+
+    for (const semesterUrl of filteredSemesterLinks) {
+      if (totalResourcesCrawled >= maxResources) break;
+
+      const semester = parseSemesterFromUrl(semesterUrl);
+      const semesterRecords: TheHelpersCrawlRecord[] = [];
+
+      try {
         await withCrawlerDelay();
-        await page.goto(subjectUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
-        visitedSubjects += 1;
-        records.push(...await extractResourcesFromSubjectPage(page, subjectUrl));
+        await gotoWithRetry(page, semesterUrl);
+        const subjectLinks = extractSubjectLinks(await page.content());
+
+        const filteredSubjectUrls = subjectLinks.filter((url) => 
+          shouldCrawlSubject(url, subjectFilter)
+        );
+
+        const workerCount = Math.min(2, filteredSubjectUrls.length);
+        const workerPromises: Promise<void>[] = [];
+        let nextSubjectIndex = 0;
+
+        for (let i = 0; i < workerCount; i++) {
+          const workerPage = i === 0 ? page : await browser.newPage();
+          
+          workerPromises.push((async () => {
+            while (nextSubjectIndex < filteredSubjectUrls.length && totalResourcesCrawled < maxResources) {
+              const index = nextSubjectIndex++;
+              const subjectUrl = filteredSubjectUrls[index];
+              try {
+                await withCrawlerDelay();
+                await gotoWithRetry(workerPage, subjectUrl);
+                
+                const recs = await extractResourcesFromSubjectPage(workerPage, subjectUrl, {
+                  semester,
+                  subjectFilter,
+                  maxResources,
+                  getCurrentCount: () => totalResourcesCrawled,
+                  incrementCount: () => { totalResourcesCrawled++; },
+                  seenKeys,
+                  incrementDuplicates: () => { totalDuplicatesSkipped++; },
+                  incrementFailed: () => { totalFailedPages++; }
+                });
+                semesterRecords.push(...recs);
+              } catch (error) {
+                totalFailedPages++;
+                console.error(`Failed to crawl subject page ${subjectUrl}:`, error);
+              }
+            }
+            if (workerPage !== page) {
+              await workerPage.close();
+            }
+          })());
+        }
+
+        await Promise.all(workerPromises);
+
+        // Incremental progress saving per semester
+        if (semesterRecords.length > 0) {
+          records.push(...semesterRecords);
+          await appendJsonl(outputPath, semesterRecords);
+        }
+      } catch (error) {
+        totalFailedPages++;
+        console.error(`Failed to crawl semester page ${semesterUrl}:`, error);
       }
-      if (visitedSubjects >= maxSubjects) break;
     }
   } finally {
     await browser.close();
   }
-  await writeJsonl(outputPath, records);
-  return { records: records.length, visitedSemesters, visitedSubjects, outputPath };
+
+  const stats = computeGroupedStats(records, semestersFoundList);
+  return {
+    semestersFound: semestersFoundCount,
+    semesters: stats.semesters,
+    totalSemestersCrawled: stats.totalSemestersCrawled,
+    totalSubjectsFound: stats.totalSubjectsFound,
+    totalResourcesFound: stats.totalResourcesFound,
+    totalFileViewerLinksFound: stats.totalFileViewerLinksFound,
+    totalDownloadUrlsFound: stats.totalDownloadUrlsFound,
+    totalMetadataOnly: stats.totalMetadataOnly,
+    totalDuplicatesSkipped,
+    totalFailedPages,
+    outputPath
+  };
 }
 
 function stripHtml(input: string) {
@@ -225,7 +513,7 @@ function inferResourceTitle(href?: string, onclick?: string) {
 function inferNearbyResourceTitle(block: string, linkIndex: number) {
   const before = stripHtml(block.slice(Math.max(0, linkIndex - 220), linkIndex));
   const parts = before.split(/\s{2,}|[|]/).map((part) => part.trim()).filter(Boolean);
-  return parts.at(-1)?.replace(/\b(View|Download|Open)$/i, "").trim();
+  return parts.at(-1)?.replace(/\b(View|Download|Open)$/i, "").trim() || "";
 }
 
 function escapeRegExp(input: string) {
